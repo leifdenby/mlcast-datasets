@@ -18,6 +18,11 @@ VALIDATOR_PACKAGE = "mlcast-dataset-validator"
 # key in the intake catalog entry metadata giving the validator version that the
 # dataset conforms to
 VALIDATOR_VERSION_METADATA_KEY = "mlcast_dataset_validator_version"
+# global attribute on the dataset itself giving the validator version that it
+# conforms to, datasets created before this attribute was introduced are assumed
+# to conform to v0.3.0
+VALIDATOR_VERSION_DATASET_ATTR = "mlcast_dataset_validator_version"
+DEFAULT_DATASET_VALIDATOR_VERSION = Version("0.3.0")
 # validator version pinned in pyproject.toml, datasets that conform to a different
 # version are validated in an isolated environment using uvx
 INSTALLED_VALIDATOR_VERSION = Version(importlib.metadata.version(VALIDATOR_PACKAGE))
@@ -79,11 +84,15 @@ def _catalog_validator_version(dataset_name: str, item) -> Version:
     return Version(str(version))
 
 
-def _validate_in_process(item, spec):
+def _dataset_validator_version(ds) -> Version:
+    version = ds.attrs.get(VALIDATOR_VERSION_DATASET_ATTR)
+    if version is None:
+        return DEFAULT_DATASET_VALIDATOR_VERSION
+    return Version(str(version))
+
+
+def _validate_in_process(item, ds, spec):
     validate_dataset = _load_validator(spec)
-    if not hasattr(item, "to_dask"):
-        pytest.fail(f"Dataset '{item.name}' does not support to_dask().")
-    ds = item.to_dask()
 
     # set storage_options explicitly on ds.attrs so that it is available to the
     # validator, which needs these when working out the zarr store path for the
@@ -154,8 +163,30 @@ def test_dataset_passes_validator(catalog, dataset_name):
         pytest.fail(f"No validator spec mapping for dataset '{dataset_name}'.")
 
     version = _catalog_validator_version(dataset_name, item)
+
+    if not hasattr(item, "to_dask"):
+        pytest.fail(f"Dataset '{dataset_name}' does not support to_dask().")
+    ds = item.to_dask()
+
+    dataset_version = _dataset_validator_version(ds)
+    if dataset_version != version:
+        if VALIDATOR_VERSION_DATASET_ATTR in ds.attrs:
+            dataset_claim = (
+                f"the dataset's `{VALIDATOR_VERSION_DATASET_ATTR}` attribute says "
+                f"{dataset_version}"
+            )
+        else:
+            dataset_claim = (
+                f"the dataset has no `{VALIDATOR_VERSION_DATASET_ATTR}` attribute, "
+                f"so it's assumed to conform to {dataset_version}"
+            )
+        pytest.fail(
+            f"Catalog entry '{dataset_name}' says the dataset conforms to "
+            f"{VALIDATOR_PACKAGE}=={version}, but {dataset_claim}."
+        )
+
     if version == INSTALLED_VALIDATOR_VERSION:
-        _validate_in_process(item, spec)
+        _validate_in_process(item, ds, spec)
     else:
         _validate_in_isolated_env(item, spec, version)
 
