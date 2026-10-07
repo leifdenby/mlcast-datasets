@@ -1,14 +1,26 @@
 import importlib
+import importlib.metadata
+import shutil
+import subprocess
 import sys
 
 import pytest
 from loguru import logger
+from packaging.version import Version
 
 import mlcast_datasets
 
 VALIDATOR_SPECS = {
     "precipitation": ("source_data", "radar_precipitation"),
 }
+
+VALIDATOR_PACKAGE = "mlcast-dataset-validator"
+# key in the intake catalog entry metadata giving the validator version that the
+# dataset conforms to
+VALIDATOR_VERSION_METADATA_KEY = "mlcast_dataset_validator_version"
+# validator version pinned in pyproject.toml, datasets that conform to a different
+# version are validated in an isolated environment using uvx
+INSTALLED_VALIDATOR_VERSION = Version(importlib.metadata.version(VALIDATOR_PACKAGE))
 
 
 @pytest.fixture
@@ -56,19 +68,21 @@ def _load_validator(spec):
     return module.validate_dataset
 
 
-@pytest.mark.parametrize("dataset_name", all_entries())
-def test_dataset_passes_validator(catalog, dataset_name):
-    item = catalog[dataset_name]
-    if item.container == "catalog":
-        pytest.skip("Catalog entry; validator applies to datasets only.")
+def _catalog_validator_version(dataset_name: str, item) -> Version:
+    version = item.reader.metadata.get(VALIDATOR_VERSION_METADATA_KEY)
+    if version is None:
+        pytest.fail(
+            f"Catalog entry '{dataset_name}' doesn't set "
+            f"`metadata.{VALIDATOR_VERSION_METADATA_KEY}`, the validator version "
+            "that the dataset conforms to."
+        )
+    return Version(str(version))
 
-    spec = _infer_validator_spec(dataset_name)
-    if spec is None:
-        pytest.fail(f"No validator spec mapping for dataset '{dataset_name}'.")
 
+def _validate_in_process(item, spec):
     validate_dataset = _load_validator(spec)
     if not hasattr(item, "to_dask"):
-        pytest.fail(f"Dataset '{dataset_name}' does not support to_dask().")
+        pytest.fail(f"Dataset '{item.name}' does not support to_dask().")
     ds = item.to_dask()
 
     # set storage_options explicitly on ds.attrs so that it is available to the
@@ -80,6 +94,70 @@ def test_dataset_passes_validator(catalog, dataset_name):
 
     if report.has_fails():
         pytest.fail(report.summarize())
+
+
+def _validate_in_isolated_env(item, spec, version: Version):
+    """
+    Run the validator at `version` with uvx in a subprocess. Only the exit code
+    is checked, so this gives pass/fail rather than a full report.
+    """
+    if shutil.which("uvx") is None:
+        pytest.fail(
+            f"uvx is required to validate '{item.name}' against "
+            f"{VALIDATOR_PACKAGE}=={version}, but it wasn't found on PATH."
+        )
+
+    data_stage, product = spec
+    storage_options = dict(item.reader.data.storage_options or {})
+    cmd = [
+        "uvx",
+        "--from",
+        f"{VALIDATOR_PACKAGE}=={version}",
+        "mlcast.validate_dataset",
+        data_stage,
+        product,
+        item.reader.data.url,
+    ]
+    endpoint_url = storage_options.pop("endpoint_url", None)
+    if endpoint_url is not None:
+        cmd += ["--s3-endpoint-url", endpoint_url]
+    if storage_options.pop("anon", False):
+        cmd.append("--s3-anon")
+    if storage_options:
+        pytest.fail(
+            f"Storage options {storage_options} for '{item.name}' can't be passed "
+            "to the validator CLI."
+        )
+
+    logger.debug(f"Running {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    output = result.stdout + result.stderr
+    print(output, file=sys.stderr)
+
+    # the validator CLI catches exceptions with loguru and still exits with 0, so
+    # look for the logged error too
+    if result.returncode != 0 or "An error has been caught" in output:
+        pytest.fail(
+            f"Dataset '{item.name}' failed validation with "
+            f"{VALIDATOR_PACKAGE}=={version} (exit code {result.returncode})."
+        )
+
+
+@pytest.mark.parametrize("dataset_name", all_entries())
+def test_dataset_passes_validator(catalog, dataset_name):
+    item = catalog[dataset_name]
+    if item.container == "catalog":
+        pytest.skip("Catalog entry; validator applies to datasets only.")
+
+    spec = _infer_validator_spec(dataset_name)
+    if spec is None:
+        pytest.fail(f"No validator spec mapping for dataset '{dataset_name}'.")
+
+    version = _catalog_validator_version(dataset_name, item)
+    if version == INSTALLED_VALIDATOR_VERSION:
+        _validate_in_process(item, spec)
+    else:
+        _validate_in_isolated_env(item, spec, version)
 
 
 @pytest.mark.modified_on_branch
